@@ -413,9 +413,11 @@ export default function Home() {
         } as any);
       }
       console.log("[lz] tx sent", { hash: tx.hash });
-      
+
       setTxHash(tx.hash);
       setStatus("Transaction sent");
+      // Reset LayerZero worker status until we refetch
+      setLzWorkerStatus(null);
       
       // Wait for receipt
       const receipt = await tx.wait();
@@ -440,7 +442,117 @@ export default function Home() {
       setStatus("Error");
     }
   };
-  
+
+  // LayerZero Worker Status state and fetcher
+  const [lzWorkerStatus, setLzWorkerStatus] = React.useState<{
+    stage: string;
+    networkBase?: string | null;
+    dvn?: string | null;
+    sealer?: string | null;
+    dest?: string | null;
+    dstTx?: string | null;
+  } | null>(null);
+
+  // External aggregator status (steps-based)
+  interface AggStep { name: string; done: boolean; txHash?: string; chainId?: number; timestamp?: number }
+  interface AggStatus { guid?: string; srcChainId?: number; dstChainId?: number; currentStatus?: string; steps?: AggStep[] }
+  const [aggStatus, setAggStatus] = React.useState<AggStatus | null>(null);
+  const STATUS_POLL_MS = parseInt(process.env.NEXT_PUBLIC_STATUS_POLL_MS || '5000');
+
+  // Helper: map chainId to explorer base if configured
+  const getExplorerByChainId = (chainId?: number): string | undefined => {
+    if (!chainId) return undefined;
+    try {
+      const keys = getNetworkKeys();
+      for (const k of keys) {
+        const cfg = getNetworkConfig(k);
+        if (cfg.chainId === chainId) return cfg.explorerTxBase;
+      }
+    } catch {}
+    return undefined;
+  };
+
+  const getNetworkNameByChainId = (chainId?: number): string | undefined => {
+    if (!chainId) return undefined;
+    try {
+      const keys = getNetworkKeys();
+      for (const k of keys) {
+        const cfg = getNetworkConfig(k);
+        if (cfg.chainId === chainId) return cfg.name;
+      }
+    } catch {}
+    return undefined;
+  };
+
+  React.useEffect(() => {
+    if (!txHash) return;
+    let stopped = false;
+    const tick = async () => {
+      try {
+        // External aggregator
+        const statusApiBase = process.env.NEXT_PUBLIC_STATUS_API_BASE;
+        if (statusApiBase) {
+          try {
+            const res = await fetch(`${statusApiBase}/api/tx/by-hash/${txHash}`);
+            if (res.ok) {
+              const json = await res.json();
+              setAggStatus(json);
+              if (json?.currentStatus === 'executed') {
+                stopped = true;
+              }
+            } else {
+              setAggStatus(null);
+            }
+          } catch {
+            setAggStatus(null);
+          }
+        } else {
+          setAggStatus(null);
+        }
+
+        // Fallback: on-chain status
+        const useOnChain = sourceNetwork === 'hii' || destNetwork === 'hii';
+        const isTestnet = sourceNetwork === 'sepolia' || destNetwork === 'sepolia';
+        const url = useOnChain ? '/api/lz-status-onchain' : '/api/lz-status';
+        const body = useOnChain
+          ? { txHash, sourceNetwork, destNetwork, tokenId }
+          : { txHash, network: isTestnet ? 'testnet' : undefined };
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        if (!res.ok) {
+          setLzWorkerStatus({ stage: 'unknown' });
+        } else {
+          const json = await res.json();
+          const dvn = json?.verification?.dvn?.status ?? null;
+          const sealer = json?.verification?.sealer?.status ?? null;
+          const dest = json?.destination?.status ?? null;
+          const dstTx = json?.destination?.tx?.txHash ?? json?.destination?.txHash ?? null;
+          setLzWorkerStatus({
+            stage: json?.stage || 'unknown',
+            networkBase: json?.networkBase || null,
+            dvn,
+            sealer,
+            dest,
+            dstTx,
+          });
+        }
+      } catch (e) {
+        setLzWorkerStatus({ stage: 'unknown' });
+      }
+    };
+    tick();
+    const id = setInterval(() => {
+      if (!stopped) tick();
+    }, STATUS_POLL_MS);
+    return () => {
+      stopped = true;
+      clearInterval(id);
+    };
+  }, [txHash, sourceNetwork, destNetwork, tokenId]);
+
   // Save transaction to history
   const saveToHistory = (tx: any) => {
     try {
@@ -648,6 +760,54 @@ export default function Home() {
                   View on Explorer
                 </a>
               )}
+              <div className="mt-3">
+                <p className="text-sm font-medium">Cross-Chain Worker Status</p>
+                <p className="text-sm">{aggStatus?.currentStatus ? aggStatus.currentStatus : (lzWorkerStatus?.stage || 'unknown')}</p>
+                {lzWorkerStatus && (
+                  <div className="mt-1 text-xs text-gray-600 dark:text-gray-300">
+                    {lzWorkerStatus.dvn && <p>DVN: {lzWorkerStatus.dvn}</p>}
+                    {lzWorkerStatus.sealer && <p>Sealer: {lzWorkerStatus.sealer}</p>}
+                    {lzWorkerStatus.dest && <p>Destination: {lzWorkerStatus.dest}</p>}
+                    {lzWorkerStatus.dstTx && (
+                      <p>
+                        Destination Tx: <a href={`${(getNetworkConfig(destNetwork || sourceNetwork || '').explorerTxBase || '')}${lzWorkerStatus.dstTx}`} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline">{lzWorkerStatus.dstTx}</a>
+                      </p>
+                    )}
+                  </div>
+                )}
+                {aggStatus?.steps && aggStatus.steps.length > 0 && (
+                  <div className="mt-2">
+                    <p className="text-sm font-medium">Worker Steps</p>
+                    <ul className="mt-1 space-y-1">
+                      {(['sent','dvn_verifying','committed','executed'] as const).map((stepName) => {
+                        const s = (aggStatus.steps || []).find((x) => x.name === stepName);
+                        const base = getExplorerByChainId(s?.chainId);
+                        const chainName = getNetworkNameByChainId(s?.chainId) || '';
+                        return (
+                          <li key={stepName} className="text-xs text-gray-700 dark:text-gray-300 flex items-center gap-2">
+                            <span className={`inline-block px-2 py-0.5 rounded ${s?.done ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-700'}`}>
+                              {stepName}{s?.done ? ': SUCCEEDED' : ': PENDING'}
+                            </span>
+                            {chainName && <span className="inline-flex items-center text-gray-600">🌐 {chainName}</span>}
+                            {s?.txHash && (
+                              <span>
+                                {base ? (
+                                  <a href={`${base}${s.txHash}`} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline">{s.txHash}</a>
+                                ) : (
+                                  <span className="font-mono">{s.txHash}</span>
+                                )}
+                              </span>
+                            )}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                    {aggStatus.guid && (
+                      <p className="mt-2 text-xs">GUID: <span className="font-mono">{aggStatus.guid}</span></p>
+                    )}
+                  </div>
+                )}
+              </div>
             </div>
           )}
           
