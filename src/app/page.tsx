@@ -531,38 +531,30 @@ export default function Home() {
     let stopped = false;
     const tick = async () => {
       try {
-        // External aggregator
-        const statusApiBase = process.env.NEXT_PUBLIC_STATUS_API_BASE;
-        const statusApiUser = process.env.NEXT_PUBLIC_STATUS_API_USERNAME || '';
-        const statusApiPass = process.env.NEXT_PUBLIC_STATUS_API_PASSWORD || '';
-        const authHeader = (statusApiUser && statusApiPass)
-          ? `Basic ${typeof window !== 'undefined' ? btoa(`${statusApiUser}:${statusApiPass}`) : Buffer.from(`${statusApiUser}:${statusApiPass}`).toString('base64')}`
-          : undefined;
-        if (statusApiBase) {
-          try {
-            const res = await fetch(`${statusApiBase}/api/tx/by-hash/${txHash}` , {
-              headers: authHeader ? { Authorization: authHeader } : undefined,
+        // External aggregator via secure server-side proxy (no public creds)
+        try {
+          const res = await fetch('/api/agg-status', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ txHash }),
+          });
+          if (res.ok) {
+            const json = await res.json();
+            setAggStatus((prev) => {
+              const prevRank = getStatusRank(prev?.currentStatus);
+              const newRank = getStatusRank(json?.currentStatus);
+              // Do not regress status; prefer forward progress
+              if (!prev || newRank >= prevRank) return json;
+              return prev;
             });
-            if (res.ok) {
-              const json = await res.json();
-              setAggStatus((prev) => {
-                const prevRank = getStatusRank(prev?.currentStatus);
-                const newRank = getStatusRank(json?.currentStatus);
-                // Do not regress status; prefer forward progress
-                if (!prev || newRank >= prevRank) return json;
-                return prev;
-              });
-              if (json?.currentStatus === 'executed') {
-                stopped = true;
-              }
-            } else {
-              // Keep previous aggStatus on transient errors to avoid flicker
+            if (json?.currentStatus === 'executed') {
+              stopped = true;
             }
-          } catch {
+          } else {
             // Keep previous aggStatus on transient errors to avoid flicker
           }
-        } else {
-          // No external aggregator configured; keep previous aggStatus
+        } catch {
+          // Keep previous aggStatus on transient errors to avoid flicker
         }
 
         // Fallback: on-chain status
