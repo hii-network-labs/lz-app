@@ -916,14 +916,6 @@ export default function Home() {
                       })()}
                     </div>
                     <div className="flex items-center gap-2">
-                      <span className="text-gray-500">Sender:</span>
-                      {srcTx?.from ? (
-                        <span className="font-mono">{srcTx.from}</span>
-                      ) : (
-                        <span className="inline-block w-3 h-3 border-2 border-current/70 border-t-transparent rounded-full animate-spin" />
-                      )}
-                    </div>
-                    <div className="flex items-center gap-2">
                       <span className="text-gray-500">Tokens Transferred:</span>
                       {amount ? (
                         <span>{`${amount} ${tokens.find(t => t.id === tokenId)?.symbol || ''}`}</span>
