@@ -430,11 +430,15 @@ export default function Home() {
       setStatus("Transaction sent");
       // Reset LayerZero worker status until we refetch
       setLzWorkerStatus(null);
-      
-      // Wait for receipt
-      const receipt = await tx.wait();
-      console.log("[lz] tx confirmed", { blockNumber: receipt?.blockNumber, status: receipt?.status });
-      setStatus("Transaction confirmed");
+
+      // Wait for receipt in background without blocking UI
+      tx.wait().then((receipt: ethers.TransactionReceipt) => {
+        console.log("[lz] tx confirmed", { blockNumber: receipt?.blockNumber, status: receipt?.status });
+        setStatus("Transaction confirmed");
+      }).catch((waitErr: any) => {
+        console.warn("[lz] tx wait failed", waitErr);
+        // Keep existing status; polling and UI continue
+      });
       
       // Save to history (optional)
       saveToHistory({
@@ -452,8 +456,9 @@ export default function Home() {
       const msg = decoded || error?.message || "Failed to send cross-chain transaction";
       setError(`${msg}${rpcData ? ` | data: ${rpcData}` : ""}`);
       setStatus("Error");
-    } finally {
       setIsSending(false);
+    } finally {
+      // Do not clear loading here; we'll stop loading when executed is detected
     }
   };
 
@@ -648,6 +653,16 @@ export default function Home() {
     };
     run();
   }, [txHash, sourceNetwork]);
+
+  // Stop Send button loading when execution/delivery completes
+  React.useEffect(() => {
+    if (!txHash) return;
+    const executedFromAgg = (aggStatus?.currentStatus || '').toLowerCase() === 'executed';
+    const executedFromWorker = (lzWorkerStatus?.stage || '').toLowerCase() === 'executed' || (lzWorkerStatus?.dest || '').toLowerCase() === 'delivered';
+    if (executedFromAgg || executedFromWorker) {
+      setIsSending(false);
+    }
+  }, [txHash, aggStatus?.currentStatus, lzWorkerStatus?.stage, lzWorkerStatus?.dest]);
 
   // When a new txHash is set, clear aggregator and worker statuses to avoid stale data
   React.useEffect(() => {
