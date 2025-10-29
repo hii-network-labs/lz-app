@@ -32,6 +32,9 @@ export default function Home() {
   const [error, setError] = useState("");
   const [account, setAccount] = useState("");
   const [currentChainId, setCurrentChainId] = useState<number | null>(null);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [isSwitching, setIsSwitching] = useState(false);
+  const [isSending, setIsSending] = useState(false);
   
   // Supported pairs and restrictions
   const supportedPairs = getSupportedPairs();
@@ -65,6 +68,7 @@ export default function Home() {
       return;
     }
     try {
+      setIsConnecting(true);
       const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
       const addr = accounts[0] || "";
       setAccount(addr);
@@ -74,6 +78,8 @@ export default function Home() {
     } catch (err: any) {
       console.error("Error connecting wallet", err);
       setError(err.message || "Failed to connect wallet");
+    } finally {
+      setIsConnecting(false);
     }
   };
   
@@ -226,6 +232,7 @@ export default function Home() {
     const config = getNetworkConfig(sourceNetwork);
     
     try {
+      setIsSwitching(true);
       await window.ethereum.request({
         method: "wallet_switchEthereumChain",
         params: [{ chainId: "0x" + config.chainId.toString(16) }],
@@ -252,6 +259,8 @@ export default function Home() {
         console.error("Error switching chain", error);
         setError("Failed to switch network");
       }
+    } finally {
+      setIsSwitching(false);
     }
   };
   
@@ -282,6 +291,7 @@ export default function Home() {
     }
     
     try {
+      setIsSending(true);
       setStatus("Sending...");
       setError("");
       
@@ -300,6 +310,7 @@ export default function Home() {
       if (!resolvedAmount) {
         setError("Balance not loaded; connect wallet and choose token");
         setStatus("Error");
+        setIsSending(false);
         return;
       }
 
@@ -308,6 +319,7 @@ export default function Home() {
       const oftAddress = token?.addresses?.[sourceNetwork];
       if (!oftAddress) {
         setError("Selected token is not supported on source network");
+        setIsSending(false);
         return;
       }
       const oft = getSignedOftContractAt(sourceNetwork, oftAddress, signer);
@@ -440,6 +452,8 @@ export default function Home() {
       const msg = decoded || error?.message || "Failed to send cross-chain transaction";
       setError(`${msg}${rpcData ? ` | data: ${rpcData}` : ""}`);
       setStatus("Error");
+    } finally {
+      setIsSending(false);
     }
   };
 
@@ -458,6 +472,34 @@ export default function Home() {
   interface AggStatus { guid?: string; srcChainId?: number; dstChainId?: number; currentStatus?: string; steps?: AggStep[] }
   const [aggStatus, setAggStatus] = React.useState<AggStatus | null>(null);
   const STATUS_POLL_MS = parseInt(process.env.NEXT_PUBLIC_STATUS_POLL_MS || '5000');
+  const [srcReceipt, setSrcReceipt] = React.useState<any | null>(null);
+  const [srcTx, setSrcTx] = React.useState<any | null>(null);
+  const [srcBlockNumber, setSrcBlockNumber] = React.useState<number | null>(null);
+  const [srcBlockTimestamp, setSrcBlockTimestamp] = React.useState<number | null>(null);
+
+  // Helpers for timestamp formatting and duration
+  const toMs = (t?: number | null) => {
+    if (typeof t !== 'number' || !Number.isFinite(t)) return undefined;
+    return t > 1e12 ? t : t * 1000; // assume seconds -> ms if small
+  };
+  const formatUtc = (ms?: number) => (typeof ms === 'number' ? new Date(ms).toUTCString() : undefined);
+  const formatDurationMs = (startMs?: number, endMs?: number) => {
+    if (typeof startMs !== 'number' || typeof endMs !== 'number') return undefined;
+    const diff = Math.max(0, endMs - startMs);
+    if (diff < 1000) return `${diff} ms`;
+    const secs = diff / 1000;
+    if (secs < 60) return `${secs.toFixed(1)} s`;
+    const mins = Math.floor(secs / 60);
+    const rem = (secs % 60).toFixed(0);
+    return `${mins}m ${rem}s`;
+  };
+
+  // Helper: rank status to avoid regressions in UI
+  const getStatusRank = (s?: string | null) => {
+    const order = ['unknown','sent','dvn_verifying','committed','executing','executed'];
+    const idx = order.indexOf((s || 'unknown').toLowerCase());
+    return idx === -1 ? 0 : idx;
+  };
 
   // Helper: map chainId to explorer base if configured
   const getExplorerByChainId = (chainId?: number): string | undefined => {
@@ -491,23 +533,36 @@ export default function Home() {
       try {
         // External aggregator
         const statusApiBase = process.env.NEXT_PUBLIC_STATUS_API_BASE;
+        const statusApiUser = process.env.NEXT_PUBLIC_STATUS_API_USERNAME || '';
+        const statusApiPass = process.env.NEXT_PUBLIC_STATUS_API_PASSWORD || '';
+        const authHeader = (statusApiUser && statusApiPass)
+          ? `Basic ${typeof window !== 'undefined' ? btoa(`${statusApiUser}:${statusApiPass}`) : Buffer.from(`${statusApiUser}:${statusApiPass}`).toString('base64')}`
+          : undefined;
         if (statusApiBase) {
           try {
-            const res = await fetch(`${statusApiBase}/api/tx/by-hash/${txHash}`);
+            const res = await fetch(`${statusApiBase}/api/tx/by-hash/${txHash}` , {
+              headers: authHeader ? { Authorization: authHeader } : undefined,
+            });
             if (res.ok) {
               const json = await res.json();
-              setAggStatus(json);
+              setAggStatus((prev) => {
+                const prevRank = getStatusRank(prev?.currentStatus);
+                const newRank = getStatusRank(json?.currentStatus);
+                // Do not regress status; prefer forward progress
+                if (!prev || newRank >= prevRank) return json;
+                return prev;
+              });
               if (json?.currentStatus === 'executed') {
                 stopped = true;
               }
             } else {
-              setAggStatus(null);
+              // Keep previous aggStatus on transient errors to avoid flicker
             }
           } catch {
-            setAggStatus(null);
+            // Keep previous aggStatus on transient errors to avoid flicker
           }
         } else {
-          setAggStatus(null);
+          // No external aggregator configured; keep previous aggStatus
         }
 
         // Fallback: on-chain status
@@ -523,24 +578,32 @@ export default function Home() {
           body: JSON.stringify(body)
         });
         if (!res.ok) {
-          setLzWorkerStatus({ stage: 'unknown' });
+          // Keep previous worker status on errors to avoid regressions
+          setLzWorkerStatus((prev) => prev || { stage: 'unknown' });
         } else {
           const json = await res.json();
           const dvn = json?.verification?.dvn?.status ?? null;
           const sealer = json?.verification?.sealer?.status ?? null;
           const dest = json?.destination?.status ?? null;
           const dstTx = json?.destination?.tx?.txHash ?? json?.destination?.txHash ?? null;
-          setLzWorkerStatus({
+          const next = {
             stage: json?.stage || 'unknown',
             networkBase: json?.networkBase || null,
             dvn,
             sealer,
             dest,
             dstTx,
+          };
+          setLzWorkerStatus((prev) => {
+            const prevRank = getStatusRank(prev?.stage);
+            const newRank = getStatusRank(next?.stage);
+            // Prefer forward progress; do not regress stage
+            if (!prev || newRank >= prevRank) return next;
+            return prev;
           });
         }
       } catch (e) {
-        setLzWorkerStatus({ stage: 'unknown' });
+        setLzWorkerStatus((prev) => prev || { stage: 'unknown' });
       }
     };
     tick();
@@ -552,6 +615,54 @@ export default function Home() {
       clearInterval(id);
     };
   }, [txHash, sourceNetwork, destNetwork, tokenId]);
+
+  // Fetch source transaction and receipt for details (block, created time, sender)
+  React.useEffect(() => {
+    const run = async () => {
+      try {
+        if (!txHash || !sourceNetwork) {
+          setSrcReceipt(null);
+          setSrcTx(null);
+          setSrcBlockNumber(null);
+          setSrcBlockTimestamp(null);
+          return;
+        }
+        // Clear previous source tx/receipt/block data before fetching new ones
+        setSrcTx(null);
+        setSrcReceipt(null);
+        setSrcBlockNumber(null);
+        setSrcBlockTimestamp(null);
+        const provider = getProvider(sourceNetwork);
+        const tx = await provider.getTransaction(txHash).catch(() => null);
+        const receipt = await provider.getTransactionReceipt(txHash).catch(() => null);
+        setSrcTx(tx);
+        setSrcReceipt(receipt);
+        // Fetch block for timestamp and stable block number
+        const blockNum = receipt?.blockNumber ?? tx?.blockNumber;
+        if (blockNum) {
+          const block = await provider.getBlock(blockNum).catch(() => null);
+          setSrcBlockNumber(block?.number ?? blockNum);
+          setSrcBlockTimestamp(block?.timestamp ?? null);
+        } else {
+          setSrcBlockNumber(null);
+          setSrcBlockTimestamp(null);
+        }
+      } catch {
+        setSrcTx(null);
+        setSrcReceipt(null);
+        setSrcBlockNumber(null);
+        setSrcBlockTimestamp(null);
+      }
+    };
+    run();
+  }, [txHash, sourceNetwork]);
+
+  // When a new txHash is set, clear aggregator and worker statuses to avoid stale data
+  React.useEffect(() => {
+    if (!txHash) return;
+    setAggStatus(null);
+    setLzWorkerStatus(null);
+  }, [txHash]);
 
   // Save transaction to history
   const saveToHistory = (tx: any) => {
@@ -591,9 +702,14 @@ export default function Home() {
             <div className="mt-2 flex gap-2">
               {!account ? (
                 <button
-                  className="bg-blue-500 hover:bg-blue-600 text-white py-1 px-3 rounded text-sm"
+                  className="bg-blue-500 hover:bg-blue-600 text-white py-1 px-3 rounded text-sm inline-flex items-center gap-2"
                   onClick={connectWallet}
+                  disabled={isConnecting}
+                  aria-busy={isConnecting}
                 >
+                  {isConnecting && (
+                    <span className="inline-block w-3 h-3 border-2 border-white/70 border-t-transparent rounded-full animate-spin" />
+                  )}
                   Connect Wallet
                 </button>
               ) : (
@@ -729,17 +845,25 @@ export default function Home() {
           
           <div className="flex flex-col md:flex-row gap-2 mb-6">
             <button
-              className={`bg-blue-500 hover:bg-blue-600 text-white py-2 px-4 rounded ${!isPairSupported ? 'opacity-50 cursor-not-allowed' : ''}`}
+              className={`bg-blue-500 hover:bg-blue-600 text-white py-2 px-4 rounded inline-flex items-center gap-2 ${(!isPairSupported || isSwitching) ? 'opacity-50 cursor-not-allowed' : ''}`}
               onClick={switchNetwork}
-              disabled={!isPairSupported}
+              disabled={!isPairSupported || isSwitching}
+              aria-busy={isSwitching}
             >
+              {isSwitching && (
+                <span className="inline-block w-3 h-3 border-2 border-white/70 border-t-transparent rounded-full animate-spin" />
+              )}
               Switch to Source Network
             </button>
             <button
-              className={`bg-green-500 hover:bg-green-600 text-white py-2 px-4 rounded ${!isPairSupported ? 'opacity-50 cursor-not-allowed' : ''}`}
+              className={`bg-green-500 hover:bg-green-600 text-white py-2 px-4 rounded inline-flex items-center gap-2 ${(!isPairSupported || isSending) ? 'opacity-50 cursor-not-allowed' : ''}`}
               onClick={sendCrossChain}
-              disabled={!isPairSupported}
+              disabled={!isPairSupported || isSending}
+              aria-busy={isSending}
             >
+              {isSending && (
+                <span className="inline-block w-3 h-3 border-2 border-white/70 border-t-transparent rounded-full animate-spin" />
+              )}
               Send Cross-Chain
             </button>
           </div>
@@ -747,64 +871,131 @@ export default function Home() {
           
           {txHash && (
             <div className="mb-4 p-3 bg-gray-100 dark:bg-gray-700 rounded">
-              <p className="text-sm font-medium">Transaction Hash</p>
-              <p className="font-mono text-sm truncate">{txHash}</p>
-              <p className="text-sm mt-1">Status: {status}</p>
-              {sourceNetwork && (
-                <a
-                  href={`${(getNetworkConfig(sourceNetwork).explorerTxBase || (sourceNetwork === 'sepolia' ? 'https://eth-sepolia.blockscout.com/tx/' : 'http://115.75.100.60:8067/tx/'))}${txHash}`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-blue-500 hover:underline text-sm"
-                >
-                  View on Explorer
-                </a>
-              )}
               <div className="mt-3">
-                <p className="text-sm font-medium">Cross-Chain Worker Status</p>
-                <p className="text-sm">{aggStatus?.currentStatus ? aggStatus.currentStatus : (lzWorkerStatus?.stage || 'unknown')}</p>
-                {lzWorkerStatus && (
-                  <div className="mt-1 text-xs text-gray-600 dark:text-gray-300">
-                    {lzWorkerStatus.dvn && <p>DVN: {lzWorkerStatus.dvn}</p>}
-                    {lzWorkerStatus.sealer && <p>Sealer: {lzWorkerStatus.sealer}</p>}
-                    {lzWorkerStatus.dest && <p>Destination: {lzWorkerStatus.dest}</p>}
-                    {lzWorkerStatus.dstTx && (
-                      <p>
-                        Destination Tx: <a href={`${(getNetworkConfig(destNetwork || sourceNetwork || '').explorerTxBase || '')}${lzWorkerStatus.dstTx}`} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline">{lzWorkerStatus.dstTx}</a>
-                      </p>
-                    )}
+                {/* Message · Outbound (combined details) */}
+                <div className="mt-4 p-3 bg-white dark:bg-gray-800 rounded border border-gray-200 dark:border-gray-700">
+                  <div className="flex items-center gap-2 mb-2">
+                    <p className="text-sm font-semibold">Message · Outbound</p>
+                    <span className={`text-xs px-2 py-0.5 rounded ${aggStatus?.currentStatus === 'executed' ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-700'}`}>{aggStatus?.currentStatus === 'executed' ? 'DELIVERED' : 'PROCESSING'}</span>
                   </div>
-                )}
+                  <div className="text-xs space-y-1">
+                    <div className="flex items-center gap-2">
+                      <span className="text-gray-500">Created:</span>
+                      {(() => {
+                        const sentStep = (aggStatus?.steps || []).find((x) => x.name === 'sent');
+                        const createdMs = toMs(sentStep?.timestamp);
+                        const createdStr = formatUtc(createdMs);
+                        return createdStr ? <span>{createdStr}</span> : (<span className="inline-block w-3 h-3 border-2 border-current/70 border-t-transparent rounded-full animate-spin" />);
+                      })()}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-gray-500">Executed:</span>
+                      {(() => {
+                        const execStep = (aggStatus?.steps || []).find((x) => x.name === 'executed');
+                        const execMs = toMs(execStep?.timestamp);
+                        const execStr = formatUtc(execMs);
+                        return execStr ? <span>{execStr}</span> : (<span className="inline-block w-3 h-3 border-2 border-current/70 border-t-transparent rounded-full animate-spin" />);
+                      })()}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-gray-500">Time Taken:</span>
+                      {(() => {
+                        const sentStep = (aggStatus?.steps || []).find((x) => x.name === 'sent');
+                        const execStep = (aggStatus?.steps || []).find((x) => x.name === 'executed');
+                        const createdMs = toMs(sentStep?.timestamp);
+                        const execMs = toMs(execStep?.timestamp);
+                        const dur = formatDurationMs(createdMs, execMs);
+                        return dur ? <span>{dur}</span> : (<span className="inline-block w-3 h-3 border-2 border-current/70 border-t-transparent rounded-full animate-spin" />);
+                      })()}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-gray-500">Sender:</span>
+                      {srcTx?.from ? (
+                        <span className="font-mono">{srcTx.from}</span>
+                      ) : (
+                        <span className="inline-block w-3 h-3 border-2 border-current/70 border-t-transparent rounded-full animate-spin" />
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-gray-500">Tokens Transferred:</span>
+                      {amount ? (
+                        <span>{`${amount} ${tokens.find(t => t.id === tokenId)?.symbol || ''}`}</span>
+                      ) : (
+                        <span className="inline-block w-3 h-3 border-2 border-current/70 border-t-transparent rounded-full animate-spin" />
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-gray-500">Source Tx:</span>
+                      {txHash ? (
+                        <a href={`${(getNetworkConfig(sourceNetwork || '').explorerTxBase || '')}${txHash}`} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline">{txHash}</a>
+                      ) : (
+                        <span className="inline-block w-3 h-3 border-2 border-current/70 border-t-transparent rounded-full animate-spin" />
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-gray-500">Destination Tx:</span>
+                      {(() => {
+                        const executedStep = (aggStatus?.steps || []).find((x) => x.name === 'executed');
+                        const dstTxHash = executedStep?.txHash; // only show when executed step provides hash
+                        const dstChainId = executedStep?.chainId ?? (aggStatus?.dstChainId ?? (destNetwork ? getNetworkConfig(destNetwork).chainId : undefined));
+                        const base = getExplorerByChainId(dstChainId) || (destNetwork ? getNetworkConfig(destNetwork).explorerTxBase : '');
+                        return dstTxHash ? (
+                          <a href={`${base || ''}${dstTxHash}`} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline">{dstTxHash}</a>
+                        ) : (
+                          <span className="inline-block w-3 h-3 border-2 border-current/70 border-t-transparent rounded-full animate-spin" />
+                        );
+                      })()}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-gray-500">Status:</span>
+                      <span className={`text-xs px-2 py-0.5 rounded ${aggStatus?.currentStatus === 'executed' ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-700'}`}>{aggStatus?.currentStatus || (lzWorkerStatus?.stage || 'unknown')}</span>
+                    </div>
+                  </div>
+                </div>
+
                 {aggStatus?.steps && aggStatus.steps.length > 0 && (
-                  <div className="mt-2">
-                    <p className="text-sm font-medium">Worker Steps</p>
+                  <div className="mt-4">
+                    <div className="flex items-center gap-3">
+                      <p className="text-sm font-medium">Worker Steps</p>
+                      {aggStatus?.guid && (
+                        <span className="text-xs font-mono text-gray-600 dark:text-gray-300">GUID: {aggStatus?.guid}</span>
+                      )}
+                    </div>
                     <ul className="mt-1 space-y-1">
                       {(['sent','dvn_verifying','committed','executed'] as const).map((stepName) => {
                         const s = (aggStatus.steps || []).find((x) => x.name === stepName);
-                        const base = getExplorerByChainId(s?.chainId);
-                        const chainName = getNetworkNameByChainId(s?.chainId) || '';
+                        const effectiveChainId = s?.chainId ?? (stepName === 'sent'
+                          ? (aggStatus?.srcChainId ?? (sourceNetwork ? getNetworkConfig(sourceNetwork).chainId : undefined))
+                          : (aggStatus?.dstChainId ?? (destNetwork ? getNetworkConfig(destNetwork).chainId : undefined))
+                        );
+                        const chainFallbackCfg = stepName === 'sent'
+                          ? (sourceNetwork ? getNetworkConfig(sourceNetwork) : (aggStatus?.srcChainId ? getNetworkConfig(sourceNetwork || destNetwork || '') : { name: '', explorerTxBase: '' } as any))
+                          : (destNetwork ? getNetworkConfig(destNetwork) : (sourceNetwork ? getNetworkConfig(sourceNetwork) : { name: '', explorerTxBase: '' } as any));
+                        const base = (getExplorerByChainId(effectiveChainId) || chainFallbackCfg.explorerTxBase || '');
+                        const chainName = (getNetworkNameByChainId(effectiveChainId) || chainFallbackCfg.name || '');
+                        const stepTxHash = stepName === 'sent' ? txHash : s?.txHash; // remove dstTx fallback to avoid premature hashes
                         return (
                           <li key={stepName} className="text-xs text-gray-700 dark:text-gray-300 flex items-center gap-2">
-                            <span className={`inline-block px-2 py-0.5 rounded ${s?.done ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-700'}`}>
+                            <span className={`inline-flex items-center gap-2 px-2 py-0.5 rounded ${s?.done ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-700'}`}>
                               {stepName}{s?.done ? ': SUCCEEDED' : ': PENDING'}
+                              {!s?.done && (<span className="inline-block w-3 h-3 border-2 border-current/70 border-t-transparent rounded-full animate-spin" />)}
                             </span>
-                            {chainName && <span className="inline-flex items-center text-gray-600">🌐 {chainName}</span>}
-                            {s?.txHash && (
+                            <span className="inline-flex items-center text-gray-600">🌐 {chainName || '—'}</span>
+                            {stepTxHash ? (
                               <span>
                                 {base ? (
-                                  <a href={`${base}${s.txHash}`} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline">{s.txHash}</a>
+                                  <a href={`${base}${stepTxHash}`} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline">{stepTxHash}</a>
                                 ) : (
-                                  <span className="font-mono">{s.txHash}</span>
+                                  <span className="font-mono">{stepTxHash}</span>
                                 )}
                               </span>
+                            ) : (
+                              <span className="text-gray-500">—</span>
                             )}
                           </li>
                         );
                       })}
                     </ul>
-                    {aggStatus.guid && (
-                      <p className="mt-2 text-xs">GUID: <span className="font-mono">{aggStatus.guid}</span></p>
-                    )}
                   </div>
                 )}
               </div>

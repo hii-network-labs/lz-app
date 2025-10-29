@@ -45,9 +45,33 @@ export async function POST(req: Request) {
       ? Number(srcReceipt.blockNumber)
       : Math.max(0, Number(toBlock) - recentWindow);
 
+    // 1b) Extract source origin.nonce from the source receipt (PacketSent)
+    const endpointIface = new ethers.Interface(endpointAbi as any);
+    const pad32 = (addr: string) => '0x' + addr.toLowerCase().slice(2).padStart(64, '0');
+    const expectedSender = pad32(oftSrc);
+    const expectedSrcEid = srcConfig.eid;
+    let srcNonce: bigint | null = null;
+    if (srcReceipt && Array.isArray((srcReceipt as any).logs)) {
+      for (const log of (srcReceipt as any).logs) {
+        try {
+          const parsed = endpointIface.parseLog(log);
+          if (!parsed || parsed?.name !== 'PacketSent') continue;
+          const origin = parsed.args?.origin as { srcEid: number, sender: string, nonce: bigint };
+          if (!origin) continue;
+          const srcEidOk = Number(origin.srcEid) === Number(expectedSrcEid);
+          const senderOk = String(origin.sender).toLowerCase() === expectedSender.toLowerCase();
+          if (srcEidOk && senderOk) {
+            srcNonce = origin.nonce;
+            break;
+          }
+        } catch {
+          // ignore unrelated logs
+        }
+      }
+    }
+
     // 2) Scan destination EndpointV2 logs (using ABI) for PacketDelivered and PacketVerified
     const endpointAddress = dstConfig.endpointV2;
-    const endpointIface = new ethers.Interface(endpointAbi as any);
     const deliveredTopic = ethers.id('PacketDelivered((uint32,bytes32,uint64),address)');
     const verifiedTopic = ethers.id('PacketVerified((uint32,bytes32,uint64),address,bytes32)');
 
@@ -65,10 +89,7 @@ export async function POST(req: Request) {
       topics: [verifiedTopic],
     }).catch(() => [] as any[]);
 
-    // Helper: left-pad address to bytes32
-    const pad32 = (addr: string) => '0x' + addr.toLowerCase().slice(2).padStart(64, '0');
-    const expectedSender = pad32(oftSrc);
-    const expectedSrcEid = srcConfig.eid;
+    // Helper: match conditions with optional nonce gating
 
     let matched: { dstTx: string, origin: { srcEid: number, sender: string, nonce: bigint }, receiver?: string } | null = null;
     for (const log of deliveredLogs) {
@@ -80,9 +101,19 @@ export async function POST(req: Request) {
         if (!origin) continue;
         const srcEidOk = Number(origin.srcEid) === Number(expectedSrcEid);
         const senderOk = String(origin.sender).toLowerCase() === expectedSender.toLowerCase();
+        // Require source receipt present and nonce match to avoid false positives
         if (srcEidOk && senderOk) {
-          matched = { dstTx: log.transactionHash, origin, receiver };
-          break;
+          if (srcReceipt && srcNonce != null) {
+            if (origin.nonce === srcNonce) {
+              matched = { dstTx: log.transactionHash, origin, receiver };
+              break;
+            } else {
+              continue;
+            }
+          } else {
+            // If we don't have a source receipt/nonce, do not declare delivered yet
+            continue;
+          }
         }
       } catch {
         // Ignore decode failures from unrelated events
@@ -101,8 +132,13 @@ export async function POST(req: Request) {
           const srcEidOk = Number(origin.srcEid) === Number(expectedSrcEid);
           const senderOk = String(origin.sender).toLowerCase() === expectedSender.toLowerCase();
           if (srcEidOk && senderOk) {
-            verified = { dstTx: log.transactionHash, origin };
-            break;
+            // Require source receipt and matching nonce for verified correlation
+            if (srcReceipt && srcNonce != null && origin.nonce === srcNonce) {
+              verified = { dstTx: log.transactionHash, origin };
+              break;
+            } else {
+              continue;
+            }
           }
         } catch {
           // Ignore decode failures from unrelated events
@@ -141,7 +177,7 @@ export async function POST(req: Request) {
       ? 'executed'
       : verified
       ? 'verified'
-      : (srcReceipt ? (sentOk ? 'inflight' : 'unknown') : 'inflight');
+      : (srcReceipt ? (sentOk ? 'inflight' : 'inflight') : 'inflight');
 
     // Normalize origin object to avoid BigInt in JSON (nonce -> string)
     const normalizeOrigin = (o: any) => {
