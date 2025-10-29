@@ -29,12 +29,15 @@ export async function POST(req: NextRequest) {
     const auth = user && pass ? 'Basic ' + Buffer.from(`${user}:${pass}`).toString('base64') : undefined;
 
     const upstream = `${base}/api/tx/by-hash/${txHash}`;
+    console.log('[agg-status proxy] upstream request', { base, path: upstream, auth });
     const res = await fetch(upstream, {
       headers: {
         ...(auth ? { Authorization: auth } : {}),
         'Accept': 'application/json',
       },
     });
+    
+    console.log('[agg-status proxy] upstream response', { status: res.status, headers: res.headers });
 
     if (!res.ok) {
       const text = await res.text();
