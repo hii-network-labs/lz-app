@@ -19,31 +19,35 @@ interface TxHistory {
 
 export default function Home() {
   // State variables
-  const [sourceNetwork, setSourceNetwork] = useState("");
-  const [destNetwork, setDestNetwork] = useState("");
-  const [amount, setAmount] = useState("");
-  const [receiverAddress, setReceiverAddress] = useState("");
+  const [sourceNetwork, setSourceNetwork] = useState<string>("");
+  const [destNetwork, setDestNetwork] = useState<string>("");
+  const [amount, setAmount] = useState<string>("");
+  const [receiverAddress, setReceiverAddress] = useState<string>("");
   const [tokenId, setTokenId] = useState<string>("");
   const [tokenDecimals, setTokenDecimals] = useState<number>(18);
   const [balanceWei, setBalanceWei] = useState<bigint | null>(null);
   const [balanceFormatted, setBalanceFormatted] = useState<string>("");
-  const [txHash, setTxHash] = useState("");
-  const [status, setStatus] = useState("");
-  const [error, setError] = useState("");
-  const [account, setAccount] = useState("");
+  const [txHash, setTxHash] = useState<string>("");
+  const [status, setStatus] = useState<string>("");
+  const [error, setError] = useState<string>("");
+  const [account, setAccount] = useState<string>("");
   const [currentChainId, setCurrentChainId] = useState<number | null>(null);
-  const [isConnecting, setIsConnecting] = useState(false);
-  const [isSwitching, setIsSwitching] = useState(false);
-  const [isSending, setIsSending] = useState(false);
+  const [isConnecting, setIsConnecting] = useState<boolean>(false);
+  const [isSwitching, setIsSwitching] = useState<boolean>(false);
+  const [isSending, setIsSending] = useState<boolean>(false);
   
   // Supported pairs and restrictions
   const supportedPairs = getSupportedPairs();
   const networkKeys = getNetworkKeys();
   const tokens = getTokensConfig();
+  const selectedToken = tokens.find(t => t.id === tokenId);
+  const usingNativeAdapter = !!selectedToken?.nativeAdapter;
   const allowedSources = Array.from(new Set(supportedPairs.map((p) => p.src))).filter((k) => networkKeys.includes(k));
   const allowedDestForSourceBase = sourceNetwork ? supportedPairs.filter((p) => p.src === sourceNetwork).map((p) => p.dst) : [];
   const tokenSupportedNetworks = tokenId ? Object.keys(tokens.find(t => t.id === tokenId)?.addresses || {}) : [];
-  const allowedDestForSource = sourceNetwork ? (tokenId ? allowedDestForSourceBase.filter((dst) => tokenSupportedNetworks.includes(dst)) : allowedDestForSourceBase) : [];
+  // Destination options depend only on supported pairs for the selected source
+  const allowedDestForSource = sourceNetwork ? allowedDestForSourceBase : [];
+  // Sources list can remain filtered by token if desired; keep as-is for now
   const allowedSourcesFilteredByToken = tokenId ? allowedSources.filter((src) => tokenSupportedNetworks.includes(src)) : allowedSources;
   const isPairSupported = !!(sourceNetwork && destNetwork && supportedPairs.some((p) => p.src === sourceNetwork && p.dst === destNetwork));
   
@@ -154,8 +158,8 @@ export default function Home() {
     });
     if (matchingNetwork) {
       // Only set defaults when no selection has been made yet
-      setSourceNetwork(prev => prev || matchingNetwork);
-      setDestNetwork(prev => {
+      setSourceNetwork((prev: string) => prev || matchingNetwork);
+      setDestNetwork((prev: string) => {
         if (prev) return prev;
         const firstAllowed = supportedPairs.find((p) => p.src === matchingNetwork)?.dst;
         if (firstAllowed) return firstAllowed;
@@ -165,10 +169,10 @@ export default function Home() {
     }
   }, [currentChainId]);
 
-  // When token selection changes, adjust destination if it becomes unsupported
+  // When token selection changes, adjust destination only if pair becomes unsupported (ignore token restrictions)
   useEffect(() => {
     if (!tokenId || !sourceNetwork) return;
-    if (destNetwork && !allowedDestForSource.includes(destNetwork)) {
+    if (destNetwork && !supportedPairs.some((p) => p.src === sourceNetwork && p.dst === destNetwork)) {
       const next = allowedDestForSource[0] || "";
       setDestNetwork(next);
     }
@@ -190,32 +194,39 @@ export default function Home() {
           setBalanceFormatted("");
           return;
         }
-        const oft = getOftContractAt(sourceNetwork, oftAddress);
-        const underlying: string = await oft.token();
         const provider = getProvider(sourceNetwork);
-        const erc20Abi = [
-          {
-            inputs: [{ internalType: 'address', name: 'owner', type: 'address' }],
-            name: 'balanceOf',
-            outputs: [{ internalType: 'uint256', name: '', type: 'uint256' }],
-            stateMutability: 'view',
-            type: 'function',
-          },
-          {
-            inputs: [],
-            name: 'decimals',
-            outputs: [{ internalType: 'uint8', name: '', type: 'uint8' }],
-            stateMutability: 'view',
-            type: 'function',
-          },
-        ];
-        const erc20 = new ethers.Contract(underlying, erc20Abi, provider);
-        const d: number = await erc20.decimals();
-        const bal: bigint = await erc20.balanceOf(account);
-        const safeDec = (typeof d === 'number' && Number.isFinite(d)) ? d : 18;
-        setTokenDecimals(safeDec);
-        setBalanceWei(bal);
-        setBalanceFormatted(ethers.formatUnits(bal, safeDec));
+        if (usingNativeAdapter) {
+          const bal: bigint = await provider.getBalance(account);
+          setTokenDecimals(18);
+          setBalanceWei(bal);
+          setBalanceFormatted(ethers.formatUnits(bal, 18));
+        } else {
+          const oft = getOftContractAt(sourceNetwork, oftAddress);
+          const underlying: string = await oft.token();
+          const erc20Abi = [
+            {
+              inputs: [{ internalType: 'address', name: 'owner', type: 'address' }],
+              name: 'balanceOf',
+              outputs: [{ internalType: 'uint256', name: '', type: 'uint256' }],
+              stateMutability: 'view',
+              type: 'function',
+            },
+            {
+              inputs: [],
+              name: 'decimals',
+              outputs: [{ internalType: 'uint8', name: '', type: 'uint8' }],
+              stateMutability: 'view',
+              type: 'function',
+            },
+          ];
+          const erc20 = new ethers.Contract(underlying, erc20Abi, provider);
+          const d: number = await erc20.decimals();
+          const bal: bigint = await erc20.balanceOf(account);
+          const safeDec = (typeof d === 'number' && Number.isFinite(d)) ? d : 18;
+          setTokenDecimals(safeDec);
+          setBalanceWei(bal);
+          setBalanceFormatted(ethers.formatUnits(bal, safeDec));
+        }
       } catch (e) {
         console.warn('[lz] balance fetch failed', e);
         setBalanceWei(null);
@@ -334,9 +345,13 @@ export default function Home() {
           stateMutability: "view",
           type: "function",
         }];
-        const erc20 = new ethers.Contract(underlying, erc20Abi, signer);
-        const d: number = await erc20.decimals();
-        decimals = d || 18;
+        if (usingNativeAdapter) {
+          decimals = 18;
+        } else {
+          const erc20 = new ethers.Contract(underlying, erc20Abi, signer);
+          const d: number = await erc20.decimals();
+          decimals = d || 18;
+        }
         console.log("[lz] underlying token decimals", decimals);
       } catch (decErr) {
         console.warn("[lz] decimals fetch failed, defaulting to 18", decErr);
@@ -392,12 +407,14 @@ export default function Home() {
       
       // Send transaction
       let tx;
+      const amtLD = ethers.parseUnits(resolvedAmount, decimals ?? 18);
+      const totalValue = usingNativeAdapter ? (fee.nativeFee + amtLD) : fee.nativeFee;
       try {
         tx = await oft.send(
           sendParam,
           { nativeFee: fee.nativeFee, lzTokenFee: fee.lzTokenFee },
           await signer.getAddress(),
-          { value: fee.nativeFee }
+          { value: totalValue }
         );
       } catch (sendErr: any) {
         const msg = sendErr?.info?.error?.data?.message || sendErr?.message || "";
@@ -418,7 +435,7 @@ export default function Home() {
         tx = await signer.sendTransaction({
           to: oft.target as string,
           data,
-          value: fee.nativeFee,
+          value: totalValue,
           gasLimit: 600000n,
           gasPrice,
           type: 0,
@@ -545,7 +562,7 @@ export default function Home() {
           });
           if (res.ok) {
             const json = await res.json();
-            setAggStatus((prev) => {
+            setAggStatus((prev: AggStatus | null) => {
               const prevRank = getStatusRank(prev?.currentStatus);
               const newRank = getStatusRank(json?.currentStatus);
               // Do not regress status; prefer forward progress
@@ -576,7 +593,7 @@ export default function Home() {
         });
         if (!res.ok) {
           // Keep previous worker status on errors to avoid regressions
-          setLzWorkerStatus((prev) => prev || { stage: 'unknown' });
+          setLzWorkerStatus((prev: { stage: string; networkBase?: string | null; dvn?: string | null; sealer?: string | null; dest?: string | null; dstTx?: string | null } | null) => prev || { stage: 'unknown' });
         } else {
           const json = await res.json();
           const dvn = json?.verification?.dvn?.status ?? null;
@@ -591,7 +608,7 @@ export default function Home() {
             dest,
             dstTx,
           };
-          setLzWorkerStatus((prev) => {
+          setLzWorkerStatus((prev: { stage: string; networkBase?: string | null; dvn?: string | null; sealer?: string | null; dest?: string | null; dstTx?: string | null } | null) => {
             const prevRank = getStatusRank(prev?.stage);
             const newRank = getStatusRank(next?.stage);
             // Prefer forward progress; do not regress stage
@@ -600,7 +617,7 @@ export default function Home() {
           });
         }
       } catch (e) {
-        setLzWorkerStatus((prev) => prev || { stage: 'unknown' });
+        setLzWorkerStatus((prev: { stage: string; networkBase?: string | null; dvn?: string | null; sealer?: string | null; dest?: string | null; dstTx?: string | null } | null) => prev || { stage: 'unknown' });
       }
     };
     tick();
@@ -747,8 +764,10 @@ export default function Home() {
                 onChange={(e) => {
                   const src = e.target.value;
                   setSourceNetwork(src);
-                  const firstAllowed = supportedPairs.find((p) => p.src === src)?.dst;
-                  if (firstAllowed) setDestNetwork(firstAllowed);
+                  // Bind destination forward from source only.
+                  // If current destination is not valid for new source, clear to re-choose.
+                  const stillValid = destNetwork && supportedPairs.some((p) => p.src === src && p.dst === destNetwork);
+                  if (!stillValid) setDestNetwork("");
                 }}
               >
                 <option value="">Select Source Network</option>
@@ -765,7 +784,11 @@ export default function Home() {
               <select
                 className="w-full p-2 border rounded"
                 value={destNetwork}
-                onChange={(e) => setDestNetwork(e.target.value)}
+                onChange={(e) => {
+                  const dst = e.target.value;
+                  // Destination change should not bind or auto-select source
+                  setDestNetwork(dst);
+                }}
               >
                 <option value="">Select Destination Network</option>
                 {(allowedDestForSource.length > 0 ? allowedDestForSource : networkKeys.filter((key) => key !== sourceNetwork)).map((key) => (
@@ -787,15 +810,8 @@ export default function Home() {
               <option value="">Select Token</option>
               {tokens
                 .filter((t) => {
-                  // Token must support source and destination if both chosen
-                  if (sourceNetwork && destNetwork) {
-                    return t.addresses[sourceNetwork] && t.addresses[destNetwork];
-                  }
-                  // If only source chosen, token must support source
-                  if (sourceNetwork && !destNetwork) {
-                    return t.addresses[sourceNetwork];
-                  }
-                  // If only token filtering the networks, show all tokens
+                  // Always filter tokens by source network support only
+                  if (sourceNetwork) return !!t.addresses[sourceNetwork];
                   return true;
                 })
                 .map((t) => (

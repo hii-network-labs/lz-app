@@ -127,7 +127,8 @@ export interface TokenConfig {
   id: string; // stable id
   symbol: string;
   name: string;
-  addresses: { [networkKey: string]: string }; // OFT addresses per network
+  addresses: { [networkKey: string]: string }; // OFT or adapter addresses per network
+  nativeAdapter?: boolean; // when true, treat address as Native OFT Adapter and send native value
 }
 
 export const getTokensConfig = (): TokenConfig[] => {
@@ -148,5 +149,47 @@ export const getTokensConfig = (): TokenConfig[] => {
     const oft = networks[key].oft;
     if (oft) addresses[key] = oft;
   }
-  return [{ id: 'default', symbol: 'OFT', name: 'OFT Token', addresses }];
+  const defaults: TokenConfig[] = [{ id: 'default', symbol: 'OFT', name: 'OFT Token', addresses }];
+  // Optionally include explicit native/wrapped tokens based on env toggle
+  const enableExtras = process.env.NEXT_PUBLIC_ENABLE_TOKEN_EXTRAS === 'true';
+  if (!enableExtras) {
+    return defaults;
+  }
+  // Build explicit tokens for both flows: native→wrapped and wrapped→native
+  const extras: TokenConfig[] = [];
+  const hiiNativeAdapter = process.env.NEXT_PUBLIC_HII_NATIVE_ADAPTER;
+  if (hiiNativeAdapter) {
+    // Native HNC is sendable only from Hii (source-side native adapter)
+    const addressesHnc: Record<string, string> = { hii: hiiNativeAdapter };
+    extras.push({
+      id: 'hnc_native',
+      symbol: 'HNC',
+      name: 'Native HNC',
+      nativeAdapter: true,
+      addresses: addressesHnc,
+    });
+  }
+  const sepoliaNativeAdapter = process.env.NEXT_PUBLIC_SEPOLIA_NATIVE_ADAPTER;
+  if (sepoliaNativeAdapter) {
+    // Native ETH is sendable only from Sepolia (source-side native adapter)
+    const addressesEth: Record<string, string> = { sepolia: sepoliaNativeAdapter };
+    extras.push({
+      id: 'eth_native',
+      symbol: 'ETH',
+      name: 'Native ETH',
+      nativeAdapter: true,
+      addresses: addressesEth,
+    });
+  }
+  // Wrapped→native flows (send wrapped ERC-20 and receive native if destination adapter exists)
+  // Explicit "wrap of the other side" tokens must use exact contract envs
+  const hiiWeth = process.env.NEXT_PUBLIC_HII_WETH_OFT;
+  if (hiiWeth) {
+    extras.push({ id: 'weth_wrapped', symbol: process.env.NEXT_PUBLIC_SEPOLIA_WRAPPED_SYMBOL || 'WETH', name: process.env.NEXT_PUBLIC_SEPOLIA_WRAPPED_NAME || 'Wrapped ETH', addresses: { hii: hiiWeth } });
+  }
+  const sepoliaWhnc = process.env.NEXT_PUBLIC_SEPOLIA_WHNC_OFT;
+  if (sepoliaWhnc) {
+    extras.push({ id: 'whnc_wrapped', symbol: process.env.NEXT_PUBLIC_HII_WRAPPED_SYMBOL || 'WHNC', name: process.env.NEXT_PUBLIC_HII_WRAPPED_NAME || 'Wrapped HNC', addresses: { sepolia: sepoliaWhnc } });
+  }
+  return [...defaults, ...extras];
 };
