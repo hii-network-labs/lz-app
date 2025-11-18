@@ -20,7 +20,13 @@ Networks and tokens are configured via public environment variables so the clien
 - Public env vars (examples):
   - `NEXT_PUBLIC_HII_*`, `NEXT_PUBLIC_SEPOLIA_*` – Names, chain IDs, RPC HTTP URLs, EndpointV2 addresses, DVN, executors, OFT addresses, etc.
   - `NEXT_PUBLIC_SUPPORTED_PAIRS` – Comma-separated pairs like `hii:sepolia`.
-  - `NEXT_PUBLIC_TOKENS_JSON` – Optional JSON array of tokens with per-network OFT addresses.
+  - `NEXT_PUBLIC_TOKENS_JSON` – Optional JSON array of tokens with per-network OFT addresses (or native adapter addresses) and optional `nativeAdapter: true`.
+  - Native adapter envs (enable native token sending without hardcoding):
+    - `NEXT_PUBLIC_HII_NATIVE_ADAPTER` – Native OFT adapter address for Hii (enables HNC native option)
+    - `NEXT_PUBLIC_SEPOLIA_NATIVE_ADAPTER` – Native OFT adapter address for Sepolia (enables ETH native option)
+  - Wrapped token label envs (optional, for clearer UX when using network `oft` addresses):
+    - `NEXT_PUBLIC_HII_WRAPPED_SYMBOL` (default `WHNC`), `NEXT_PUBLIC_HII_WRAPPED_NAME` (default `Wrapped HNC`)
+    - `NEXT_PUBLIC_SEPOLIA_WRAPPED_SYMBOL` (default `WETH`), `NEXT_PUBLIC_SEPOLIA_WRAPPED_NAME` (default `Wrapped ETH`)
 - Server-only env vars (used by serverless proxy):
   - `STATUS_API_BASE` – Aggregator API base URL.
   - `STATUS_API_USERNAME`, `STATUS_API_PASSWORD` – Basic auth credentials.
@@ -29,7 +35,9 @@ Helpers:
 - `getNetworksConfig()` reads network configs from `NEXT_PUBLIC_*` envs.
 - `getNetworkConfig(key)` returns a single network config.
 - `getSupportedPairs()` reads `NEXT_PUBLIC_SUPPORTED_PAIRS`.
-- `getTokensConfig()` reads `NEXT_PUBLIC_TOKENS_JSON` or builds a default token from network OFT addresses.
+- `getTokensConfig()` reads `NEXT_PUBLIC_TOKENS_JSON` or builds a default token from network OFT addresses. If native adapter envs are set, it adds native token options accordingly with `nativeAdapter: true`. It also adds explicit wrapped token entries (WHNC/WETH) based on network `oft` addresses and optional label envs, enabling both flows:
+  - Send native → receive wrapped: source uses native adapter; destination mapping uses the destination network’s `oft` address.
+  - Send wrapped → receive native: source uses ERC-20 `oft`; destination mapping includes the destination native adapter when present.
 
 Diagnostics:
 - `GET /api/env-check` returns whether required envs are present (without exposing their actual values).
